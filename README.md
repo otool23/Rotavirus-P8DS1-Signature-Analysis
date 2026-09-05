@@ -6,7 +6,7 @@ Rotavirus A reassortant strains.
 
 ## Requirements
 
-Python 3.x
+Python 3.10 or later
 
 Python packages:
 - numpy
