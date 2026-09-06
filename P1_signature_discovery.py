@@ -100,6 +100,24 @@ Position numbering is based on a deterministic ungapped WT reference sequence:
 the longest R_ sequence (or DG_ for VP4), breaking ties alphabetically by FASTA
 header. The selected reference is reported in the output.
 
+
+Fisher exact-test extension
+---------------------------
+For every accepted Criterion 1 and Criterion 2 signature site, this version
+also performs two-sided Fisher's exact tests using callable sequences only.
+
+Non-VP4:
+    - RP only versus each existing comparison group (R, O, G)
+    - RP + WTP combined versus each existing comparison group (R, O, G)
+
+VP4:
+    - LGR only versus DG
+    - LGR + LGWT combined versus DG
+
+Benjamini-Hochberg FDR correction is reported both within each predefined test
+family and globally across all Fisher tests. Separate combined, AA-only, and
+NU-only Fisher CSV files and AA/NU FDR heatmaps are produced.
+
 Reproducibility outputs
 -----------------------
 The script records:
@@ -141,13 +159,15 @@ from pathlib import Path
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy
+from scipy.stats import fisher_exact
 
 
 # ============================================================================
 # CONSTANTS
 # ============================================================================
 
-SCRIPT_VERSION = "2.0.0"
+SCRIPT_VERSION = "2.1.0"
 
 SEGMENTS = [
     "VP1", "VP2", "VP3", "VP4", "VP6",
@@ -244,6 +264,7 @@ def write_run_metadata(
         f"Platform: {platform.platform()}",
         f"NumPy version: {np.__version__}",
         f"Matplotlib version: {matplotlib.__version__}",
+        f"SciPy version: {scipy.__version__}",
         f"Minimum callable fraction: {min_callable_fraction:.4f}",
         "",
         "Input FASTA SHA-256 checksums",
@@ -1383,6 +1404,566 @@ def make_coverage_heatmap(
     plt.close()
 
 
+
+# ============================================================================
+# FISHER'S EXACT TESTS FOR ACCEPTED SIGNATURE SITES
+# ============================================================================
+
+FISHER_FIELDS = [
+    "Sequence_type",
+    "Segment",
+    "Position",
+    "Alignment_column",
+    "Mutation",
+    "Criterion",
+    "Reassortant_state",
+    "Test_mode",
+    "Reassortant_groups",
+    "Comparison_group",
+    "Comparison_role",
+    "Reassortant_state_n",
+    "Reassortant_callable_N",
+    "Reassortant_not_state_n",
+    "Comparison_state_n",
+    "Comparison_callable_N",
+    "Comparison_not_state_n",
+    "Reassortant_n_over_callable",
+    "Comparison_n_over_callable",
+    "Odds_ratio",
+    "Fisher_p_two_sided",
+    "BH_FDR_within_family",
+    "BH_FDR_global",
+    "Significant_FDR_0.05",
+]
+
+
+def bh_fdr(p_values: list[float]) -> list[float]:
+    """
+    Benjamini-Hochberg false-discovery-rate correction.
+
+    NaN p-values are retained as NaN and are not included in the correction.
+    """
+    adjusted = [math.nan] * len(p_values)
+
+    valid = [
+        (index, float(p))
+        for index, p in enumerate(p_values)
+        if p is not None and not math.isnan(float(p))
+    ]
+
+    if not valid:
+        return adjusted
+
+    valid.sort(key=lambda item: item[1])
+    m = len(valid)
+
+    ranked_adjusted = [0.0] * m
+
+    for rank, (_, p_value) in enumerate(valid, start=1):
+        ranked_adjusted[rank - 1] = min(
+            1.0,
+            p_value * m / rank,
+        )
+
+    # Enforce monotonicity from largest rank to smallest.
+    for i in range(m - 2, -1, -1):
+        ranked_adjusted[i] = min(
+            ranked_adjusted[i],
+            ranked_adjusted[i + 1],
+        )
+
+    for (original_index, _), adj_p in zip(valid, ranked_adjusted):
+        adjusted[original_index] = adj_p
+
+    return adjusted
+
+
+def _int_field(row: dict[str, object], field: str) -> int:
+    value = row.get(field, "")
+
+    if value in ("", None):
+        return 0
+
+    return int(float(value))
+
+
+def _fisher_row(
+    *,
+    signature_row: dict[str, object],
+    test_mode: str,
+    reassortant_groups: str,
+    comparison_group: str,
+    comparison_role: str,
+    reassortant_state_n: int,
+    reassortant_callable_n: int,
+    comparison_state_n: int,
+    comparison_callable_n: int,
+) -> dict[str, object] | None:
+    """
+    Build and run one 2x2 Fisher's exact test.
+
+    Table:
+
+                         reassortant state   other callable state
+        test group              a                    b
+        comparison group        c                    d
+    """
+    if reassortant_callable_n <= 0 or comparison_callable_n <= 0:
+        return None
+
+    a = reassortant_state_n
+    b = reassortant_callable_n - reassortant_state_n
+    c = comparison_state_n
+    d = comparison_callable_n - comparison_state_n
+
+    odds_ratio, p_value = fisher_exact(
+        [[a, b], [c, d]],
+        alternative="two-sided",
+    )
+
+    return {
+        "Sequence_type": signature_row["Sequence_type"],
+        "Segment": signature_row["Segment"],
+        "Position": signature_row["Position"],
+        "Alignment_column": signature_row["Alignment_column"],
+        "Mutation": signature_row["Mutation"],
+        "Criterion": signature_row["Criterion"],
+        "Reassortant_state": signature_row["Reassortant_state"],
+        "Test_mode": test_mode,
+        "Reassortant_groups": reassortant_groups,
+        "Comparison_group": comparison_group,
+        "Comparison_role": comparison_role,
+        "Reassortant_state_n": a,
+        "Reassortant_callable_N": reassortant_callable_n,
+        "Reassortant_not_state_n": b,
+        "Comparison_state_n": c,
+        "Comparison_callable_N": comparison_callable_n,
+        "Comparison_not_state_n": d,
+        "Reassortant_n_over_callable": f"{a}/{reassortant_callable_n}",
+        "Comparison_n_over_callable": f"{c}/{comparison_callable_n}",
+        "Odds_ratio": float(odds_ratio),
+        "Fisher_p_two_sided": float(p_value),
+        "BH_FDR_within_family": math.nan,
+        "BH_FDR_global": math.nan,
+        "Significant_FDR_0.05": "",
+    }
+
+
+def run_fisher_tests(
+    signatures: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """
+    Run Fisher's exact tests at every ACCEPTED Criterion 1 or Criterion 2 site.
+
+    Two predefined test modes are evaluated.
+
+    Non-VP4:
+        1. RP only versus each existing comparison group R, O, G.
+        2. RP + WTP combined versus each existing comparison group R, O, G.
+
+    VP4:
+        1. LGR only versus DG.
+        2. LGR + LGWT combined versus DG.
+
+    Only callable sequences enter the 2x2 tables. Missing/gapped/ambiguous
+    calls remain excluded exactly as in the signature-discovery analysis.
+    """
+    fisher_rows: list[dict[str, object]] = []
+
+    for row in signatures:
+        segment = str(row["Segment"])
+
+        reass_n = _int_field(row, "Reassortant_n")
+        reass_callable = _int_field(row, "Reassortant_callable_N")
+
+        wt_b_n = _int_field(row, "WT_B_n")
+        wt_b_callable = _int_field(row, "WT_B_callable_N")
+
+        if segment == "VP4":
+            comparison_specs = [
+                ("WT_A", str(row.get("WT_A_group", "DG"))),
+            ]
+
+            single_label = "LGR_only"
+            single_groups = "LGR"
+            combined_label = "LGR_plus_LGWT"
+            combined_groups = "LGR+LGWT"
+
+        else:
+            comparison_specs = [
+                ("WT_A", str(row.get("WT_A_group", "R"))),
+                ("C", str(row.get("C_group", "O"))),
+                ("D", str(row.get("D_group", "G"))),
+            ]
+
+            single_label = "RP_only"
+            single_groups = "RP"
+            combined_label = "RP_plus_WTP"
+            combined_groups = "RP+WTP"
+
+        for comparison_role, comparison_group in comparison_specs:
+            comparison_n = _int_field(
+                row,
+                f"{comparison_role}_n",
+            )
+            comparison_callable = _int_field(
+                row,
+                f"{comparison_role}_callable_N",
+            )
+
+            # Group absent at alignment level -> no Fisher test.
+            if comparison_callable <= 0:
+                continue
+
+            # ----------------------------------------------------------
+            # Test 1: reassortant group only vs comparison group
+            # ----------------------------------------------------------
+            single = _fisher_row(
+                signature_row=row,
+                test_mode=single_label,
+                reassortant_groups=single_groups,
+                comparison_group=comparison_group,
+                comparison_role=comparison_role,
+                reassortant_state_n=reass_n,
+                reassortant_callable_n=reass_callable,
+                comparison_state_n=comparison_n,
+                comparison_callable_n=comparison_callable,
+            )
+
+            if single is not None:
+                fisher_rows.append(single)
+
+            # ----------------------------------------------------------
+            # Test 2: reassortant + WT-B group combined vs comparison
+            # ----------------------------------------------------------
+            combined = _fisher_row(
+                signature_row=row,
+                test_mode=combined_label,
+                reassortant_groups=combined_groups,
+                comparison_group=comparison_group,
+                comparison_role=comparison_role,
+                reassortant_state_n=reass_n + wt_b_n,
+                reassortant_callable_n=reass_callable + wt_b_callable,
+                comparison_state_n=comparison_n,
+                comparison_callable_n=comparison_callable,
+            )
+
+            if combined is not None:
+                fisher_rows.append(combined)
+
+    # --------------------------------------------------------------------
+    # Benjamini-Hochberg correction WITHIN each predefined test family.
+    #
+    # A family is:
+    #   sequence type + test mode + comparison group
+    #
+    # Example:
+    #   AA + RP_only + R
+    #   AA + RP_plus_WTP + R
+    #   NU + RP_only + O
+    #
+    # This corrects across all accepted sites tested for the same biological
+    # comparison while keeping distinct comparisons separate.
+    # --------------------------------------------------------------------
+    families: dict[tuple[str, str, str], list[int]] = {}
+
+    for index, row in enumerate(fisher_rows):
+        key = (
+            str(row["Sequence_type"]),
+            str(row["Test_mode"]),
+            str(row["Comparison_group"]),
+        )
+        families.setdefault(key, []).append(index)
+
+    for indices in families.values():
+        p_values = [
+            float(fisher_rows[index]["Fisher_p_two_sided"])
+            for index in indices
+        ]
+
+        adjusted = bh_fdr(p_values)
+
+        for index, adj_p in zip(indices, adjusted):
+            fisher_rows[index]["BH_FDR_within_family"] = adj_p
+
+    # Also report a conservative BH correction across every Fisher test.
+    all_p_values = [
+        float(row["Fisher_p_two_sided"])
+        for row in fisher_rows
+    ]
+    global_adjusted = bh_fdr(all_p_values)
+
+    for row, global_adj in zip(fisher_rows, global_adjusted):
+        row["BH_FDR_global"] = global_adj
+
+        family_adj = float(row["BH_FDR_within_family"])
+
+        row["Significant_FDR_0.05"] = (
+            "YES"
+            if not math.isnan(family_adj) and family_adj < 0.05
+            else "NO"
+        )
+
+    segment_order = {
+        segment: i
+        for i, segment in enumerate(SEGMENTS)
+    }
+    type_order = {"AA": 0, "NU": 1}
+
+    fisher_rows.sort(
+        key=lambda row: (
+            type_order[str(row["Sequence_type"])],
+            segment_order[str(row["Segment"])],
+            int(row["Position"]),
+            str(row["Test_mode"]),
+            str(row["Comparison_group"]),
+        )
+    )
+
+    return fisher_rows
+
+
+def make_fisher_fdr_heatmap(
+    rows: list[dict[str, object]],
+    seq_type: str,
+    output_dir: Path,
+) -> None:
+    """
+    Heatmap of -log10(BH-FDR) for Fisher tests at accepted signature sites.
+
+    The plotted FDR is the within-family Benjamini-Hochberg adjusted p-value.
+    """
+    subset = [
+        row for row in rows
+        if row["Sequence_type"] == seq_type
+    ]
+
+    if not subset:
+        print(f"No {seq_type} Fisher-test rows; Fisher heatmap skipped.")
+        return
+
+    segment_order = {
+        segment: i
+        for i, segment in enumerate(SEGMENTS)
+    }
+
+    # Unique signature sites.
+    site_keys = sorted(
+        {
+            (
+                str(row["Segment"]),
+                int(row["Position"]),
+                str(row["Mutation"]),
+                str(row["Criterion"]),
+            )
+            for row in subset
+        },
+        key=lambda item: (
+            segment_order[item[0]],
+            item[1],
+            item[2],
+        ),
+    )
+
+    # Unique test columns, deterministic and biologically readable.
+    preferred_test_order = [
+        "RP_only vs R",
+        "RP_only vs O",
+        "RP_only vs G",
+        "RP_plus_WTP vs R",
+        "RP_plus_WTP vs O",
+        "RP_plus_WTP vs G",
+        "LGR_only vs DG",
+        "LGR_plus_LGWT vs DG",
+    ]
+
+    observed_tests = {
+        f"{row['Test_mode']} vs {row['Comparison_group']}"
+        for row in subset
+    }
+
+    test_labels = [
+        label
+        for label in preferred_test_order
+        if label in observed_tests
+    ]
+
+    # Include any unexpected but valid labels deterministically.
+    test_labels.extend(
+        sorted(observed_tests - set(test_labels))
+    )
+
+    site_index = {
+        key: i
+        for i, key in enumerate(site_keys)
+    }
+    test_index = {
+        label: j
+        for j, label in enumerate(test_labels)
+    }
+
+    matrix = np.full(
+        (len(site_keys), len(test_labels)),
+        np.nan,
+        dtype=float,
+    )
+
+    for row in subset:
+        key = (
+            str(row["Segment"]),
+            int(row["Position"]),
+            str(row["Mutation"]),
+            str(row["Criterion"]),
+        )
+
+        label = (
+            f"{row['Test_mode']} vs "
+            f"{row['Comparison_group']}"
+        )
+
+        fdr = float(row["BH_FDR_within_family"])
+
+        if math.isnan(fdr):
+            value = np.nan
+        elif fdr <= 0:
+            # Avoid infinite plotting values if a numerical p-value is exactly zero.
+            value = 300.0
+        else:
+            value = -math.log10(fdr)
+
+        matrix[
+            site_index[key],
+            test_index[label],
+        ] = value
+
+    labels = [
+        f"{segment} {mutation}"
+        for segment, _, mutation, _ in site_keys
+    ]
+
+    fig_height = max(
+        5.0,
+        0.34 * len(labels) + 2.5,
+    )
+    fig_width = max(
+        10.0,
+        1.5 * len(test_labels) + 4.0,
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(fig_width, fig_height)
+    )
+
+    masked = np.ma.masked_invalid(matrix)
+
+    image = ax.imshow(
+        masked,
+        aspect="auto",
+    )
+
+    ax.set_xticks(
+        np.arange(len(test_labels))
+    )
+    ax.set_xticklabels(
+        test_labels,
+        rotation=45,
+        ha="right",
+    )
+
+    ax.set_yticks(
+        np.arange(len(labels))
+    )
+    ax.set_yticklabels(labels)
+
+    ax.set_title(
+        f"{seq_type} signature-site Fisher tests "
+        "(-log10 BH-FDR)"
+    )
+
+    threshold = -math.log10(0.05)
+
+    # Annotate each populated cell with adjusted p-value.
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            if np.isnan(matrix[i, j]):
+                text = "NA"
+            else:
+                # Find original FDR for display.
+                site_key = site_keys[i]
+                test_label = test_labels[j]
+
+                matched = [
+                    row for row in subset
+                    if (
+                        str(row["Segment"]),
+                        int(row["Position"]),
+                        str(row["Mutation"]),
+                        str(row["Criterion"]),
+                    ) == site_key
+                    and (
+                        f"{row['Test_mode']} vs "
+                        f"{row['Comparison_group']}"
+                    ) == test_label
+                ]
+
+                if matched:
+                    fdr = float(
+                        matched[0]["BH_FDR_within_family"]
+                    )
+                    text = (
+                        "<1e-300"
+                        if fdr == 0
+                        else f"{fdr:.1e}"
+                    )
+                else:
+                    text = "NA"
+
+            ax.text(
+                j,
+                i,
+                text,
+                ha="center",
+                va="center",
+                fontsize=7,
+            )
+
+    cbar = fig.colorbar(
+        image,
+        ax=ax,
+    )
+    cbar.set_label(
+        "-log10(BH-FDR)"
+    )
+
+    # Explain the significance threshold in a compact caption-like note.
+    ax.text(
+        1.0,
+        1.01,
+        f"FDR < 0.05 corresponds to -log10(FDR) > {threshold:.2f}",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=8,
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(
+        output_dir
+        / f"P1_{seq_type}_signature_Fisher_BH_FDR_heatmap.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.savefig(
+        output_dir
+        / f"P1_{seq_type}_signature_Fisher_BH_FDR_heatmap.pdf",
+        bbox_inches="tight",
+    )
+
+    plt.close()
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -1516,6 +2097,45 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------------
+    # Fisher's exact tests for every accepted Criterion 1 / Criterion 2 site
+    # ------------------------------------------------------------------------
+
+    fisher_rows = run_fisher_tests(
+        all_signatures
+    )
+
+    write_dict_rows(
+        args.output_dir / "P1_signature_Fisher_tests.csv",
+        fisher_rows,
+        FISHER_FIELDS,
+    )
+
+    write_dict_rows(
+        args.output_dir / "P1_AA_signature_Fisher_tests.csv",
+        [
+            row for row in fisher_rows
+            if row["Sequence_type"] == "AA"
+        ],
+        FISHER_FIELDS,
+    )
+
+    write_dict_rows(
+        args.output_dir / "P1_NU_signature_Fisher_tests.csv",
+        [
+            row for row in fisher_rows
+            if row["Sequence_type"] == "NU"
+        ],
+        FISHER_FIELDS,
+    )
+
+    for seq_type in SEQ_TYPES:
+        make_fisher_fdr_heatmap(
+            fisher_rows,
+            seq_type,
+            args.output_dir,
+        )
+
+    # ------------------------------------------------------------------------
     # Figures
     # ------------------------------------------------------------------------
 
@@ -1553,6 +2173,7 @@ def main() -> None:
     print(f"Accepted NU signatures:       {nu_n}")
     print(f"Candidate sites audited:      {len(all_candidates)}")
     print(f"Sequence-level failure rows:  {len(all_failures)}")
+    print(f"Fisher exact-test rows:       {len(fisher_rows)}")
     print(f"Output directory:             {args.output_dir}")
 
     print("\nKey missing-data rule:")
